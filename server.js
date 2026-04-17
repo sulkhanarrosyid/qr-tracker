@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
+const Jimp = require('jimp');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -28,17 +29,63 @@ const saveData = (data) => {
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // allow large base64 logo
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ─── Helper: composite logo onto QR code ──────────────────────────────────────
+async function compositeLogoOnQR(qrDataUrl, logoBase64) {
+  try {
+    // Convert QR data URL to buffer
+    const qrBase64 = qrDataUrl.replace(/^data:image\/\w+;base64,/, '');
+    const qrBuffer = Buffer.from(qrBase64, 'base64');
+
+    // Convert logo to buffer
+    const logoBuffer = Buffer.from(logoBase64.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+
+    const qrImage = await Jimp.read(qrBuffer);
+    const logoImage = await Jimp.read(logoBuffer);
+
+    const qrSize = qrImage.getWidth();
+
+    // Logo = 22% of QR size
+    const logoSize = Math.floor(qrSize * 0.22);
+
+    // Resize logo maintaining aspect ratio
+    logoImage.cover(logoSize, logoSize);
+
+    // White rounded background behind logo (padding of 10px each side)
+    const bgPad = 12;
+    const bgSize = logoSize + bgPad * 2;
+    const bgImage = new Jimp(bgSize, bgSize, 0xFFFFFFFF);
+
+    // Composite logo onto white bg
+    bgImage.composite(logoImage, bgPad, bgPad);
+
+    // Center position on QR
+    const x = Math.floor((qrSize - bgSize) / 2);
+    const y = Math.floor((qrSize - bgSize) / 2);
+
+    qrImage.composite(bgImage, x, y, {
+      mode: Jimp.BLEND_SOURCE_OVER,
+      opacitySource: 1,
+      opacityDest: 1
+    });
+
+    const finalBuffer = await qrImage.getBufferAsync(Jimp.MIME_PNG);
+    return `data:image/png;base64,${finalBuffer.toString('base64')}`;
+  } catch (err) {
+    console.error('Logo composite failed:', err.message);
+    return qrDataUrl; // fallback to plain QR
+  }
+}
 
 // ─── API: Create tracked QR link ──────────────────────────────────────────────
 app.post('/api/create', async (req, res) => {
   try {
-    const { url, name } = req.body;
+    const { url, name, logo } = req.body;
 
     if (!url) return res.status(400).json({ error: 'URL is required' });
 
-    // Basic URL validation
     let parsedUrl;
     try {
       parsedUrl = new URL(url);
@@ -52,13 +99,18 @@ app.post('/api/create', async (req, res) => {
     const protocol = req.protocol || 'http';
     const trackingUrl = `${protocol}://${host}/track/${id}`;
 
-    // Generate QR code as data URL (high quality)
-    const qrDataUrl = await qrcode.toDataURL(trackingUrl, {
+    // Generate base QR code (high error correction so logo doesn't break scanning)
+    let qrDataUrl = await qrcode.toDataURL(trackingUrl, {
       width: 400,
       margin: 2,
       color: { dark: '#1a1a2e', light: '#ffffff' },
       errorCorrectionLevel: 'H'
     });
+
+    // Overlay logo if provided
+    if (logo) {
+      qrDataUrl = await compositeLogoOnQR(qrDataUrl, logo);
+    }
 
     const link = {
       id,
@@ -66,10 +118,11 @@ app.post('/api/create', async (req, res) => {
       originalUrl: url,
       trackingUrl,
       qrCode: qrDataUrl,
+      hasLogo: !!logo,
       createdAt: new Date().toISOString()
     };
 
-    data.links.unshift(link); // newest first
+    data.links.unshift(link);
     saveData(data);
 
     res.json({ ...link, visitCount: 0 });
@@ -95,7 +148,6 @@ app.get('/track/:id', (req, res) => {
     `);
   }
 
-  // Parse user-agent for device info
   const ua = req.headers['user-agent'] || '';
   let device = 'Desktop';
   if (/Mobile|Android|iPhone|iPad/i.test(ua)) device = 'Mobile';
@@ -129,14 +181,12 @@ app.get('/track/:id', (req, res) => {
   data.visits.push(visit);
   saveData(data);
 
-  // Redirect to original URL
   res.redirect(302, link.originalUrl);
 });
 
 // ─── API: Get all links with stats ────────────────────────────────────────────
 app.get('/api/links', (req, res) => {
   const data = getData();
-
   const linksWithStats = data.links.map((link) => {
     const visits = data.visits.filter((v) => v.linkId === link.id);
     const sorted = [...visits].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
@@ -146,7 +196,6 @@ app.get('/api/links', (req, res) => {
       lastVisit: sorted[0]?.timestamp || null
     };
   });
-
   res.json(linksWithStats);
 });
 
@@ -164,7 +213,6 @@ app.get('/api/links/:id', (req, res) => {
   const data = getData();
   const link = data.links.find((l) => l.id === req.params.id);
   if (!link) return res.status(404).json({ error: 'Not found' });
-
   const visits = data.visits.filter((v) => v.linkId === link.id);
   res.json({ ...link, visitCount: visits.length });
 });
@@ -184,7 +232,6 @@ app.get('/api/stats', (req, res) => {
   const totalLinks = data.links.length;
   const totalVisits = data.visits.length;
 
-  // Visits in the last 7 days by day
   const now = new Date();
   const last7 = [];
   for (let i = 6; i >= 0; i--) {
@@ -196,13 +243,11 @@ app.get('/api/stats', (req, res) => {
     last7.push({ label, count });
   }
 
-  // Device breakdown
   const devices = data.visits.reduce((acc, v) => {
     acc[v.device] = (acc[v.device] || 0) + 1;
     return acc;
   }, {});
 
-  // Browser breakdown
   const browsers = data.visits.reduce((acc, v) => {
     acc[v.browser] = (acc[v.browser] || 0) + 1;
     return acc;
@@ -212,7 +257,7 @@ app.get('/api/stats', (req, res) => {
 });
 
 // ─── Start server ─────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 QR Tracker is running!`);
   console.log(`   Open: http://localhost:${PORT}\n`);
 });
